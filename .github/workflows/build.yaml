@@ -1,0 +1,281 @@
+name: Build Nginx
+run-name: Build Nginx-${{ inputs.nginxVersion }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      nginxVersion:
+        description: Nginx version
+        required: true
+        default: 1.24.0
+        type: string
+      buildForLinux:
+        description: Build for Linux
+        required: true
+        default: true
+        type: boolean
+      buildForWindows:
+        description: Build for Windows
+        required: true
+        default: true
+        type: boolean
+      uploadToReleases:
+        description: Upload to Releases
+        required: true
+        default: false
+        type: boolean
+
+jobs:
+  build-for-linux:
+    name: Build for Linux ${{ matrix.arch }}
+    if: ${{ inputs.buildForLinux }}
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup nodejs
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Generate dynamic bash
+        id: config
+        shell: bash
+        run: |
+          node -v
+          echo "================================================================"
+          npm install
+          echo "================================================================"
+          node "src/generateDynamicBash.ts" "${{ inputs.nginxVersion }}"
+          echo "================================================================"
+          cat "githubOutput.txt" >> $GITHUB_OUTPUT
+
+      - name: Download source
+        shell: bash
+        run: |
+          cat "download.sh"
+          echo "================================================================"
+          chmod +x "download.sh"
+          "./download.sh"
+
+      - name: Configure Nginx
+        shell: bash
+        run: |
+          cat > "configure.sh" << "EOF"
+          cd "${{ steps.config.outputs.nginxFolder }}"
+          auto/configure \
+            --with-compat \
+          EOF
+          cat "configureArgs.txt" >> "configure.sh"
+          cat "configureArgsAddDynamicModule.txt" >> "configure.sh"
+
+          cat "configure.sh"
+          echo "================================================================"
+          chmod +x "configure.sh"
+          "./configure.sh"
+
+      - name: Compile
+        run: |
+          cd "${{ steps.config.outputs.nginxFolder }}"
+          make modules
+          echo "================================================================"
+          ls -al objs
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: nginx-${{ inputs.nginxVersion }}-linux-${{ matrix.arch }}
+          if-no-files-found: error
+          path: |
+            ${{ steps.config.outputs.nginxFolder }}/objs/*.so
+
+  build-for-windows-x64:
+    name: Build for Windows x64 (${{ matrix.toolchain }})
+    if: ${{ inputs.buildForWindows }}
+    runs-on: windows-2025
+    strategy:
+      matrix:
+        include:
+          - toolchain: MSVC
+            cc: cl
+          - toolchain: MinGW
+            cc: /mingw64/bin/x86_64-w64-mingw32-gcc.exe
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Generate dynamic bash
+        id: config
+        shell: bash
+        run: |
+          node -v
+          echo "================================================================"
+          npm install
+          echo "================================================================"
+          node "src/generateDynamicBash.ts" "${{ inputs.nginxVersion }}"
+          cat "githubOutput.txt" >> $GITHUB_OUTPUT
+
+      - name: Download source
+        shell: bash
+        run: |
+          cat "download.sh"
+          echo "================================================================"
+          "./download.sh"
+
+      - name: Patch source for MSVC
+        if: ${{ matrix.toolchain == 'MSVC' }}
+        shell: bash
+        run: |
+          cat "msvcPatch.sh"
+          echo "================================================================"
+          "./msvcPatch.sh"
+
+      - name: Setup Visual Studio environment
+        if: ${{ matrix.toolchain == 'MSVC' }}
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Setup MSYS2
+        id: msys2
+        if: ${{ matrix.toolchain == 'MinGW' }}
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: make mingw-w64-x86_64-toolchain
+
+      - name: Configure Nginx
+        shell: bash
+        env:
+          dynamic: ${{ case(matrix.toolchain == 'MinGW', 'Dynamic', '') }}
+          dynamicVal: ${{ case(matrix.toolchain == 'MinGW', '=dynamic', '') }}
+          usingShell: ${{ case(matrix.toolchain == 'MinGW', format('''{0}/msys2_shell.cmd'' -defterm -here -no-start -mingw64 -c', steps.msys2.outputs.msys2-location), 'bash -c') }}
+          ccOptExtra: ${{ case(matrix.toolchain == 'MinGW', ' -Wno-error=unterminated-string-initialization -Wno-error=pointer-to-int-cast', '') }}
+        run: |
+          cat > "configure.sh" << "EOF"
+          cd "${{ steps.config.outputs.nginxFolder }}"
+          auto/configure \
+            --with-cc=${{ matrix.cc }} \
+            --with-compat \
+            --prefix= \
+            --conf-path=conf/nginx.conf \
+            --pid-path=logs/nginx.pid \
+            --http-log-path=logs/access.log \
+            --error-log-path=logs/error.log \
+            --sbin-path=nginx.exe \
+            --http-client-body-temp-path=temp/client_body_temp \
+            --http-proxy-temp-path=temp/proxy_temp \
+            --http-fastcgi-temp-path=temp/fastcgi_temp \
+            --http-scgi-temp-path=temp/scgi_temp \
+            --http-uwsgi-temp-path=temp/uwsgi_temp \
+            --with-cc-opt="-DFD_SETSIZE=1024${{ env.ccOptExtra }}" \
+            --with-http_v2_module \
+            --with-http_realip_module \
+            --with-http_addition_module \
+            --with-http_sub_module \
+            --with-http_dav_module \
+            --with-http_stub_status_module \
+            --with-http_flv_module \
+            --with-http_mp4_module \
+            --with-http_gunzip_module \
+            --with-http_gzip_static_module \
+            --with-http_auth_request_module \
+            --with-http_random_index_module \
+            --with-http_secure_link_module \
+            --with-http_slice_module \
+            --with-mail${{ env.dynamicVal }} \
+            --with-stream${{ env.dynamicVal }} \
+            --with-openssl-opt="no-asm no-tests -D_WIN32_WINNT=0x0501" \
+            --with-http_ssl_module \
+            --with-mail_ssl_module \
+            --with-stream_ssl_module \
+          EOF
+          cat "configureArgs.txt" >> "configure.sh"
+          cat "configureArgsAdd${{ env.dynamic }}Module.txt" >> "configure.sh"
+
+          echo "usingShell: ${{ env.usingShell }}"
+          cat "configure.sh"
+          echo "================================================================"
+          ${{ env.usingShell }} "./configure.sh"
+
+      - name: Compile using ${{ matrix.toolchain }}
+        env:
+          makeCommand: ${{ case(matrix.toolchain == 'MinGW', format('& "{0}/msys2_shell.cmd" -defterm -here -no-start -mingw64 -c make', steps.msys2.outputs.msys2-location), 'nmake') }}
+        run: |
+          cd "${{ steps.config.outputs.nginxFolder }}"
+          ${{ env.makeCommand }}
+          echo "================================================================"
+          ls objs
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: nginx-${{ inputs.nginxVersion }}-win-x64-${{ matrix.toolchain }}
+          if-no-files-found: error
+          path: |
+            ${{ steps.config.outputs.nginxFolder }}/objs/*.exe
+            ${{ steps.config.outputs.nginxFolder }}/objs/*.dll
+            ${{ steps.config.outputs.nginxFolder }}/objs/*.so
+
+  upload-to-release:
+    name: Upload to Releases
+    needs: [ build-for-linux, build-for-windows-x64 ]
+    if: ${{ !cancelled() && !failure() && inputs.uploadToReleases && (inputs.buildForLinux || inputs.buildForWindows) }}
+    runs-on: ubuntu-slim
+    concurrency:
+      group: build-${{ github.sha }}
+      cancel-in-progress: false
+      queue: max
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: allArtifacts
+          merge-multiple: true
+          skip-decompress: true
+
+      - name: Generate release note
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          find "allArtifacts" -maxdepth 1 -type f -exec basename {} \; >> "assets.txt"
+          echo "now assets:"
+          cat "assets.txt"
+          echo "================================================================"
+          set +e
+          gh release view "build-${{ github.sha }}" --json assets --jq ".assets[].name" >> "assets.txt"
+          set -e
+          echo "================================================================"
+          echo "all assets (may has duplicates):"
+          cat "assets.txt"
+          echo "================================================================"
+          node -v
+          echo "================================================================"
+          npm install
+          echo "================================================================"
+          node "src/generateReleaseNote.ts"
+          echo "================================================================"
+          cat "releaseNote.md"
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          name: Build-${{ github.sha }}
+          tag_name: build-${{ github.sha }}
+          body_path: releaseNote.md
+          files: allArtifacts/*
+          fail_on_unmatched_files: true
